@@ -1,15 +1,24 @@
 import hvac
 import os
+import json
+import logging
 
-# Vault client config
-VAULT_ADDR = os.getenv("VAULT_ADDR", "http://127.0.0.1:8200")
-VAULT_TOKEN = os.getenv("VAULT_TOKEN", "your-root-token")
+# ──────────────────────────────────────
+# Vault client config (from env vars)
+# ──────────────────────────────────────
+VAULT_ADDR  = os.getenv("VAULT_ADDR")
+VAULT_TOKEN = os.getenv("VAULT_TOKEN")
+
+if not VAULT_ADDR or not VAULT_TOKEN:
+    raise Exception("VAULT_ADDR and VAULT_TOKEN must be set in environment variables")
 
 client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN)
-
 if not client.is_authenticated():
     raise Exception("Vault auth failed. Check VAULT_TOKEN and VAULT_ADDR.")
 
+# ──────────────────────────────────────
+# Your existing functions (unchanged)
+# ──────────────────────────────────────
 def full_path(project_id):
     return f"{project_id}/env"
 
@@ -26,73 +35,83 @@ def write_secrets(project_id, secrets):
         secret=secrets
     )
 
-def create_or_update(project_id):
-    existing = read_secrets(project_id)
-    while True:
-        key = input("Enter key (or 'done' to finish): ").strip()
-        if key.lower() == "done":
-            break
-        value = input(f"Enter value for '{key}': ").strip()
-        existing[key] = value
-        write_secrets(project_id, existing)
-        print(f"✓ '{key}' set.")
+# ──────────────────────────────────────
+# NEW: Lambda handler (API-style)
+# ──────────────────────────────────────
+def handler(event, context):
+    """
+    Expected event:
+    {
+      "action": "read|write|update|delete|view",
+      "project_id": "my-app",
+      "key": "DB_PASSWORD",           # optional
+      "value": "s3cr3t"               # optional
+    }
+    """
+    logging.getLogger().setLevel(logging.INFO)
+    try:
+        action = event.get("action")
+        project_id = event.get("project_id")
 
-def update_key(project_id):
-    existing = read_secrets(project_id)
-    key = input("Key to update: ").strip()
-    if key not in existing:
-        print("⚠ Key does not exist. Use create option instead.")
-        return
-    value = input(f"New value for '{key}': ").strip()
-    existing[key] = value
-    write_secrets(project_id, existing)
-    print(f"✓ '{key}' updated.")
+        if not project_id:
+            return {"statusCode": 400, "body": json.dumps({"error": "project_id required"})}
 
-def delete_key(project_id):
-    existing = read_secrets(project_id)
-    key = input("Key to delete: ").strip()
-    if key in existing:
-        del existing[key]
-        write_secrets(project_id, existing)
-        print(f"✓ '{key}' deleted.")
-    else:
-        print("⚠ Key not found.")
+        if action == "read":
+            secrets = read_secrets(project_id)
+            return {"statusCode": 200, "body": json.dumps(secrets)}
 
-def view_secrets(project_id):
-    secrets = read_secrets(project_id)
-    if not secrets:
-        print("No secrets found.")
-    else:
-        for k, v in secrets.items():
-            print(f"{k} = {v}")
+        elif action == "write":
+            key = event.get("key")
+            value = event.get("value")
+            if not key or not value:
+                return {"statusCode": 400, "body": json.dumps({"error": "key and value required"})}
+            secrets = read_secrets(project_id)
+            secrets[key] = value
+            write_secrets(project_id, secrets)
+            return {"statusCode": 200, "body": json.dumps({"message": f"{key} set"})} 
 
-def main():
-    print("🔐 Vault Secret Manager")
-    project_id = input("Enter project ID (e.g., project-xyz): ").strip()
+        elif action == "update":
+            key = event.get("key")
+            value = event.get("value")
+            if not key or not value:
+                return {"statusCode": 400, "body": json.dumps({"error": "key and value required"})}
+            secrets = read_secrets(project_id)
+            if key not in secrets:
+                return {"statusCode": 404, "body": json.dumps({"error": "key not found"})}
+            secrets[key] = value
+            write_secrets(project_id, secrets)
+            return {"statusCode": 200, "body": json.dumps({"message": f"{key} updated"})}
 
-    while True:
-        print("\nChoose an option:")
-        print("1. Create or add new secrets")
-        print("2. Update an existing secret key")
-        print("3. Delete a secret key")
-        print("4. View current secrets")
-        print("5. Exit")
+        elif action == "delete":
+            key = event.get("key")
+            if not key:
+                return {"statusCode": 400, "body": json.dumps({"error": "key required"})}
+            secrets = read_secrets(project_id)
+            if key in secrets:
+                del secrets[key]
+                write_secrets(project_id, secrets)
+                return {"statusCode": 200, "body": json.dumps({"message": f"{key} deleted"})}
+            else:
+                return {"statusCode": 404, "body": json.dumps({"error": "key not found"})}
 
-        choice = input("Select (1-5): ").strip()
+        elif action == "view":
+            secrets = read_secrets(project_id)
+            return {"statusCode": 200, "body": json.dumps(secrets)}
 
-        if choice == "1":
-            create_or_update(project_id)
-        elif choice == "2":
-            update_key(project_id)
-        elif choice == "3":
-            delete_key(project_id)
-        elif choice == "4":
-            view_secrets(project_id)
-        elif choice == "5":
-            print("Bye!")
-            break
         else:
-            print("Invalid choice.")
+            return {"statusCode": 400, "body": json.dumps({"error": "invalid action"})}
 
+    except Exception as e:
+        logging.error(str(e))
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+# ──────────────────────────────────────
+# Keep CLI for local testing (optional)
+# ──────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    # Fallback to CLI when run locally
+    import sys
+    if len(sys.argv) > 1:
+        print("CLI mode not supported in Lambda. Use handler(event).")
+    else:
+        print("Run locally with: python vault_app.py")
